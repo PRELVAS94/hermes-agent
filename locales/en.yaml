@@ -682,6 +682,7 @@ gateway:
     no_response: "⚠️ Processing completed but no response was generated. This may be a transient error — try sending your message again."
     previous_turn_cleanup: "⚠️ Your message wasn't processed (the previous turn was still being cleaned up). Please send it again."
     unexpected_silence: "⚠️ The model returned only a silence marker for a message that needed a reply. Try again or rephrase."
+    pre_agent_timeout: "⚠️ Starting your message took too long, so it wasn't processed. Please send it again — if it keeps happening, an operator should check the gateway's health."
     empty_response_model_label: "The model"
     hint_auth: " Your sign-in to the AI model service has expired or the API key is wrong. Use /login here, or run `{relogin}` on the host."
     hint_quota: " Your AI model service balance or quota is used up. Top it up on the service's website, or use /model to switch models."

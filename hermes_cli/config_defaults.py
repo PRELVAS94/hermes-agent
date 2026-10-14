@@ -2099,6 +2099,15 @@ DEFAULT_CONFIG = {
     },
     "gateway": {  # Gateway settings (messaging platforms: Telegram, Discord, Slack, ...).
 
+        # Seconds to bound the pre-agent phase of a turn — session resolution, turn
+        # preparation and the agent:start hook emit — before the inactivity watchdog
+        # is armed inside the agent runner. The sentinel is claimed before this
+        # phase, so a stall there (a slow/blocked session store or a hanging
+        # agent:start hook) held the session forever and silently queued every
+        # later message, recoverable only by a restart. On expiry the turn is
+        # failed with a visible notice and the sentinel released. 0 disables the
+        # bound (unbounded wait, the pre-#138358 behaviour).
+        "pre_agent_timeout": 60,
         # Seconds to let a SIGTERM-interrupted gateway agent unwind before adapter/database
         # teardown. Keep short so service-manager shutdowns don't exhaust their stop budget.
         "signal_interrupt_grace_timeout": 1,

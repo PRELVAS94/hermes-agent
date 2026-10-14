@@ -616,8 +616,8 @@ class GatewayTurnMixin:
                 timeout=_float_env("HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT),
             )
         except TurnLeaseTimeoutError:
-            # The cleanup finally starts later; restore the tokens here or this exit leaks identity.
-            self._clear_session_env(_session_env_tokens)
+            # Token cleanup is owned by the prepare wrapper's ``except BaseException``
+            # (see _hmwa_prepare_turn), which clears on every exit — no per-site clear here.
             raise
         if _lease_token is not None:
             self._session_state(_quick_key).turn.lease_tokens[run_generation] = _lease_token
@@ -2048,13 +2048,33 @@ class GatewayTurnMixin:
         context prompt, sidecar notes, turn lease, transcript load + hygiene, inbound text. Returns
         ``(_PreparedTurn, env_tokens)``; a ``str`` first element is a reply to send instead of
         running (history unreadable); ``None`` drops the turn (inbound text rejected)."""
-        from gateway.run import _load_gateway_config
         from tools.approval_yolo import restore_session_yolo
         _was_auto_reset, _is_new_session = await self._hmwa_open_session(session_entry, session_key, source)
         restore_session_yolo(session_key, session_entry.yolo is True)  # a restarted gateway's set starts empty
         context = build_session_context(source, self.config, session_entry)
         # Session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
+        # Cancellation-safe token cleanup (#138358): the pre-agent phase is now bounded by
+        # ``_pre_agent_timeout``, whose ``asyncio.wait_for`` can cancel this coroutine after the
+        # tokens are set but before they are returned for the caller's ``finally`` to clear.
+        # Without this, a cancelled prepare leaks the task-local session identity into the next turn.
+        try:
+            return await self._hmwa_prepare_turn_body(
+                event, source, session_entry, session_key, _quick_key, run_generation,
+                context, _session_env_tokens, _was_auto_reset, _is_new_session,
+            )
+        except BaseException:
+            self._clear_session_env(_session_env_tokens)
+            raise
+
+    async def _hmwa_prepare_turn_body(
+        self, event, source, session_entry, session_key, _quick_key, run_generation,
+        context, _session_env_tokens, _was_auto_reset, _is_new_session,
+    ):
+        """Body of ``_hmwa_prepare_turn`` (see its docstring); split so the token cleanup can
+        wrap every await point, including cancellation by the pre-agent timeout bound."""
+        from gateway.run import _load_gateway_config
+        from tools.approval_yolo import restore_session_yolo
         # Self-injected turns (internal=True) persist with a DB-only display_kind: timeline notices, not user bubbles.
         persist_user_display_kind = display_kind_for_event(event)
         _redact_pii = False  # privacy.redact_pii, re-read per message
@@ -2141,6 +2161,24 @@ class GatewayTurnMixin:
             title_user_message=title_user_message,
         ), _session_env_tokens
 
+    async def _hmwa_pre_agent_timeout_reply(self, event, source, session_key: str, phase: str) -> str:
+        """Surface the pre-agent phase timeout notice (#138358).
+
+        Logs the stall with the session and phase, then returns the user-facing
+        notice. The sentinel release is owned by the caller's outer ``finally``
+        (``_release_running_agent_state``); returning here lets that run normally.
+        """
+        logger.warning(
+            "Pre-agent phase timed out after %.0fs during %s for session %s — "
+            "releasing the turn slot (#138358)",
+            self._pre_agent_timeout, phase, session_key,
+        )
+        try:
+            await self._hmwa_stop_typing_for_turn(event, source)
+        except Exception:
+            logger.debug("pre-agent timeout: typing stop failed", exc_info=True)
+        return t("gateway.errors.pre_agent_timeout")
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -2153,13 +2191,55 @@ class GatewayTurnMixin:
             (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " "),
         )
 
-        resolved = await self._hmwa_resolve_session(event, source)
+        _pre_agent_deadline = self._pre_agent_timeout if self._pre_agent_timeout > 0 else None
+        try:
+            # Pre-agent phase bound (#138358). The sentinel was claimed before this handler
+            # ran, and everything below (session resolution, turn preparation, the agent:start
+            # hook emit) awaits on the event loop with no watchdog — the inactivity watchdog
+            # only arms inside the agent runner. A stall there held the sentinel forever and
+            # silently queued every later message, recoverable only by a restart. Bound the
+            # whole phase; on expiry surface a notice and let the exception propagate so the
+            # outer finally releases the sentinel.
+            if _pre_agent_deadline is None:
+                resolved = await self._hmwa_resolve_session(event, source)
+            else:
+                try:
+                    resolved = await asyncio.wait_for(
+                        self._hmwa_resolve_session(event, source), timeout=_pre_agent_deadline,
+                    )
+                except asyncio.TimeoutError:
+                    return await self._hmwa_pre_agent_timeout_reply(
+                        event, source, _quick_key, "session resolution",
+                    )
+        except Exception:
+            # Release the sentinel for any other pre-agent failure; the outer dispatch
+            # finally still runs, but logging here keeps the stall visible.
+            logger.exception("Pre-agent session resolution failed for %s", _quick_key)
+            raise
         if resolved is None:
             return
         source, session_entry, session_key = resolved
-        prepared, _session_env_tokens = await self._hmwa_prepare_turn(
-            event, source, session_entry, session_key, _quick_key, run_generation,
-        )
+        if _pre_agent_deadline is None:
+            prepared, _session_env_tokens = await self._hmwa_prepare_turn(
+                event, source, session_entry, session_key, _quick_key, run_generation,
+            )
+        else:
+            try:
+                prepared, _session_env_tokens = await asyncio.wait_for(
+                    self._hmwa_prepare_turn(
+                        event, source, session_entry, session_key, _quick_key, run_generation,
+                    ),
+                    timeout=_pre_agent_deadline,
+                )
+            except TurnLeaseTimeoutError:
+                # Not a pre-agent stall: the turn lease is held by another routing key.
+                # Let it propagate to the dispatch handler's dedicated catch (it returns
+                # the "another turn running" notice), which this generic bound must not shadow.
+                raise
+            except asyncio.TimeoutError:
+                return await self._hmwa_pre_agent_timeout_reply(
+                    event, source, session_key, "turn preparation",
+                )
         if not isinstance(prepared, self._PreparedTurn):
             return prepared
         history, message_text = prepared.history, prepared.message_text
@@ -2174,7 +2254,21 @@ class GatewayTurnMixin:
                 "session_id": session_entry.session_id,
                 "message": message_text[:500],
             }
-            await self.hooks.emit("agent:start", hook_ctx)
+            if _pre_agent_deadline is not None:
+                # The agent:start hook is user code and can hang indefinitely; it is part of the
+                # pre-agent phase, so it is bounded by the same deadline (#138358). On expiry the
+                # notice return unwinds through this block's finally (env-token clear) and the
+                # dispatch finally (sentinel release).
+                try:
+                    await asyncio.wait_for(
+                        self.hooks.emit("agent:start", hook_ctx), timeout=_pre_agent_deadline,
+                    )
+                except asyncio.TimeoutError:
+                    return await self._hmwa_pre_agent_timeout_reply(
+                        event, source, session_key, "agent:start hook",
+                    )
+            else:
+                await self.hooks.emit("agent:start", hook_ctx)
 
             # Capture the launch session id so post-run compression publication is identity-guarded
             # (a /new may move session_entry.session_id while the old run is still unwinding).

@@ -44,6 +44,13 @@ DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT = float(DEFAULT_CONFIG["agent"]["restart_d
 DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT = float(DEFAULT_CONFIG["gateway"]["signal_interrupt_grace_timeout"])
 DEFAULT_GATEWAY_POST_INTERRUPT_GRACE_TIMEOUT = 5.0
 
+# Wall-clock bound on the pre-agent phase of a turn (#138358): the region between
+# the sentinel claim and the agent-runner entry (session resolution, turn preparation,
+# the agent:start hook emit). The inactivity watchdog only arms inside the runner, so
+# a stall here — a blocked session store or a hanging hook — held the sentinel forever
+# and silently queued every later message, recoverable only by a restart. 0 = disabled.
+DEFAULT_GATEWAY_PRE_AGENT_TIMEOUT = float(DEFAULT_CONFIG["gateway"]["pre_agent_timeout"])
+
 # In-band restart waits for active turns to finish *before* ``stop()`` begins; distinct from
 # ``restart_drain_timeout``, the force-interrupt budget once ``stop()`` runs (short under TimeoutStopSec).
 DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT = float(DEFAULT_CONFIG["agent"]["restart_after_turn_timeout"])
@@ -319,6 +326,12 @@ def parse_cron_drain_timeout(raw: object) -> float:
 def parse_signal_interrupt_grace_timeout(raw: object) -> float:
     """Parse the unexpected-signal post-interrupt grace timeout."""
     return _parse_timeout_keeping_zero(raw, DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT, finite=True)
+
+
+def parse_pre_agent_timeout(raw: object) -> float:
+    """Parse the pre-agent phase wall-clock bound; ``0`` is a deliberate opt-out
+    (unbounded wait), like the other timeouts here — not a fallback to the default."""
+    return _parse_timeout_keeping_zero(raw, DEFAULT_GATEWAY_PRE_AGENT_TIMEOUT)
 
 
 def resolve_cron_drain_budget(

@@ -18,9 +18,10 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from gateway.config import Platform
 from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, DEFAULT_GATEWAY_POST_INTERRUPT_GRACE_TIMEOUT,
+    DEFAULT_GATEWAY_PRE_AGENT_TIMEOUT,
     DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT, DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT, parse_cron_drain_timeout,
-    parse_restart_after_turn_timeout, parse_restart_drain_timeout,
+    parse_pre_agent_timeout, parse_restart_after_turn_timeout, parse_restart_drain_timeout,
     launchd_service_label, parse_signal_interrupt_grace_timeout, read_launchd_exit_timeout_s,
     resolve_launchd_capped_drain,
 )
@@ -456,6 +457,18 @@ class GatewayConfigLoadersMixin:
         if raw is not None and raw != "":
             cls._warn_unparsable_timeout(
                 "signal_interrupt_grace_timeout", raw, DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT
+            )
+        return value
+
+    @classmethod
+    def _load_pre_agent_timeout(cls) -> float:
+        """``gateway.pre_agent_timeout``: wall-clock bound on the pre-agent phase of a turn (#138358)."""
+        from gateway.run import _load_gateway_config
+        raw = cfg_get(_load_gateway_config(), "gateway", "pre_agent_timeout", default=None)
+        value = parse_pre_agent_timeout(raw)
+        if raw is not None and raw != "":
+            cls._warn_unparsable_timeout(
+                "pre_agent_timeout", raw, DEFAULT_GATEWAY_PRE_AGENT_TIMEOUT
             )
         return value
 

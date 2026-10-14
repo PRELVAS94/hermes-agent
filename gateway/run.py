@@ -2193,6 +2193,7 @@ from gateway.platforms.base import (
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT,
+    DEFAULT_GATEWAY_PRE_AGENT_TIMEOUT,
     DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT,
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT)
@@ -3365,6 +3366,7 @@ class GatewayRunner(
     _restart_after_turn_timeout: float = DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT
     _cron_drain_timeout: float = DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT
     _signal_interrupt_grace_timeout: float = DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT
+    _pre_agent_timeout: float = DEFAULT_GATEWAY_PRE_AGENT_TIMEOUT
     _exit_code: Optional[int] = None
     _draining: bool = False
     _external_drain_active: bool = False
@@ -3509,6 +3511,7 @@ class GatewayRunner(
         self._restart_after_turn_timeout = self._load_restart_after_turn_timeout()
         self._cron_drain_timeout = self._load_cron_drain_timeout()
         self._signal_interrupt_grace_timeout = self._load_signal_interrupt_grace_timeout()
+        self._pre_agent_timeout = self._load_pre_agent_timeout()
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
 
