@@ -2074,7 +2074,6 @@ class GatewayTurnMixin:
         """Body of ``_hmwa_prepare_turn`` (see its docstring); split so the token cleanup can
         wrap every await point, including cancellation by the pre-agent timeout bound."""
         from gateway.run import _load_gateway_config
-        from tools.approval_yolo import restore_session_yolo
         # Self-injected turns (internal=True) persist with a DB-only display_kind: timeline notices, not user bubbles.
         persist_user_display_kind = display_kind_for_event(event)
         _redact_pii = False  # privacy.redact_pii, re-read per message
