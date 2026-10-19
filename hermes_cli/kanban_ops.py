@@ -11,6 +11,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
@@ -111,6 +112,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, reason) in res.respawn_guarded
             ],
             "rate_limited": res.rate_limited,
+            "spawn_failed": res.spawn_failed,
             "skipped_locked": res.skipped_locked,
             "memory_pressure": res.memory_pressure,
         }, ascii=True)
@@ -141,6 +143,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")
     for tid, who, current in res.skipped_per_profile_capped:
         print(f"Deferred ({who} at per-profile cap, {current} running): {tid}")
+    if res.spawn_failed:
+        print(f"Spawn failed (retryable, counts toward the breaker): {', '.join(res.spawn_failed)}")
     if res.skipped_nonspawnable:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
@@ -155,6 +159,56 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     if res.memory_pressure:
         print(f"Memory pressure {res.memory_pressure}: new workers restricted this tick")
     return 0
+
+
+# Health telemetry for the standalone daemon: warn when every tick finds ready
+# work but spawns nothing (broken profile, PATH drift, missing venv, credential
+# loss) — the per-task breaker auto-blocks quietly, so the operator needs a signal.
+HEALTH_WINDOW = 6  # ticks (default 30s at interval=5)
+HEALTH_WARN_INTERVAL = 300  # seconds between repeats of the same warning
+
+
+def _daemon_tick_health(
+    health_state: dict,
+    res,
+    *,
+    ready_pending: bool,
+    now: Optional[int] = None,
+) -> Optional[str]:
+    """Update the standalone daemon's stuck-detection state; return its warning text.
+
+    The twin of the gateway watcher's ``bad_ticks`` counter
+    (``gateway/kanban_watchers.py``): both route the per-tick decision through
+    :func:`hermes_cli.kanban_db_dispatch.record_stuck_tick`, so the two lanes
+    cannot disagree about what "stuck" means. A tick whose only hold is an
+    assignee sitting at ``kanban.max_in_progress_per_profile`` is normal steady
+    state in both, and every other hold still warns in both.
+
+    Returns ``None`` while the streak is below ``HEALTH_WINDOW`` or the warning
+    is still cooling down; the caller prints the text when it is not ``None``.
+    """
+    health_state["bad_ticks"] = kbd.record_stuck_tick(
+        health_state.get("bad_ticks", 0),
+        [res],
+        ready_pending=ready_pending,
+        any_spawned=bool(getattr(res, "spawned", None)),
+    )
+    if health_state["bad_ticks"] < HEALTH_WINDOW:
+        return None
+    if now is None:
+        now = int(time.time())
+    if now - health_state.get("last_warn_at", 0) < HEALTH_WARN_INTERVAL:
+        return None
+    health_state["last_warn_at"] = now
+    held = kbd.describe_suppression([res])
+    held = f" Last tick held back: {held}." if held else ""
+    return (
+        f"[{_fmt_ts(now)}] WARN dispatcher stuck: ready queue non-empty for "
+        f"{health_state['bad_ticks']} consecutive ticks but 0 workers spawned "
+        f"successfully.{held} Check profile health (venv, PATH, credentials) and `hermes "
+        f"kanban list --status ready` / `hermes kanban list --status blocked` for "
+        f"recent spawn_failed tasks."
+    )
 
 
 _DAEMON_DEPRECATED = (
@@ -201,7 +255,6 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     # Health telemetry: warn when every tick finds ready work but spawns
     # nothing (broken profile, PATH drift, missing venv, credential loss) —
     # the per-task breaker auto-blocks quietly, so the operator needs a signal.
-    HEALTH_WINDOW = 6  # ticks (default 30s at interval=5)
     health_state = {"bad_ticks": 0, "last_warn_at": 0}
 
     def _ready_queue_nonempty() -> bool:
@@ -215,25 +268,9 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
 
     def _on_tick(res):
         ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
-        if ready_pending and not res.spawned:
-            health_state["bad_ticks"] += 1
-        else:
-            health_state["bad_ticks"] = 0
-        # Warn once per HEALTH_WINDOW bad ticks, at most every 5 minutes.
-        if health_state["bad_ticks"] >= HEALTH_WINDOW:
-            now = int(time.time())
-            if now - health_state["last_warn_at"] >= 300:
-                held = kbd.describe_suppression([res])
-                held = f" Last tick held back: {held}." if held else ""
-                print(
-                    f"[{_fmt_ts(now)}] WARN dispatcher stuck: ready queue non-empty for "
-                    f"{health_state['bad_ticks']} consecutive ticks but 0 workers spawned "
-                    f"successfully.{held} Check profile health (venv, PATH, credentials) and `hermes "
-                    f"kanban list --status ready` / `hermes kanban list --status blocked` for "
-                    f"recent spawn_failed tasks.",
-                    file=sys.stderr, flush=True,
-                )
-                health_state["last_warn_at"] = now
+        warning = _daemon_tick_health(health_state, res, ready_pending=ready_pending)
+        if warning is not None:
+            print(warning, file=sys.stderr, flush=True)
         if not verbose:
             return
         did_work = (
