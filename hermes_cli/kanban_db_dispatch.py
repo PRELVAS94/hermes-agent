@@ -3,6 +3,10 @@
 Split out of ``hermes_cli.kanban_db``; origin-resident helpers are reached
 late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 ``kanban_db.<name>`` keeps working.
+
+The per-tick hold accounting — ``describe_suppression``, ``capacity_only_hold``
+and ``record_stuck_tick`` — lives in ``hermes_cli/kanban_db_dispatch_hold.py``;
+it is re-exported here, where the dispatcher lanes and their tests read it.
 """
 
 from __future__ import annotations
@@ -20,12 +24,14 @@ from dataclasses import field
 from pathlib import Path
 from typing import Any
 from typing import Callable
-from typing import Iterable
 from typing import Iterator
 from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
 
+from hermes_cli.kanban_db_dispatch_hold import capacity_only_hold
+from hermes_cli.kanban_db_dispatch_hold import describe_suppression
+from hermes_cli.kanban_db_dispatch_hold import record_stuck_tick
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
 if TYPE_CHECKING:
@@ -134,6 +140,12 @@ class DispatchResult:
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
+    spawn_failed: list[str] = field(default_factory=list)
+    """Task ids whose spawn attempt failed this tick WITHOUT tripping the breaker
+    (workspace resolution error, a raised spawn, the host refusing the slot). Kept
+    apart from ``auto_blocked`` — which is this bucket once the retry budget is
+    exhausted — because a fresh failure is still evidence the tick was stuck for a
+    reason capacity cannot explain, and a breaker needs a few ticks to trip."""
     timed_out: list[str] = field(default_factory=list)
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
@@ -153,35 +165,6 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
-
-
-def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
-    """One line naming why the tick(s) held ready work back, or ``""``.
-
-    ``active_pr=1, recent_success=2, rate_limited=1, skipped_locked=1,
-    memory_pressure=critical`` — the respawn-guard reasons counted per task
-    plus the tick-level holds. Feeds the "dispatcher stuck" warnings of the
-    CLI daemon and the embedded gateway dispatcher, which otherwise report a
-    bare zero-spawn count while ``hermes kanban tail`` is the only place the
-    guard reason is written (#111910).
-    """
-    counts: dict[str, int] = {}
-    pressure: Optional[str] = None
-    for res in results:
-        if res is None:
-            continue
-        for _task_id, reason in res.respawn_guarded:
-            counts[reason] = counts.get(reason, 0) + 1
-        if res.rate_limited:
-            counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
-        if res.skipped_locked:
-            counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
-        if res.memory_pressure:
-            pressure = res.memory_pressure
-    parts = [f"{k}={v}" for k, v in sorted(counts.items())]
-    if pressure:
-        parts.append(f"memory_pressure={pressure}")
-    return ", ".join(parts)
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -2129,6 +2112,9 @@ def _dispatch_lane_task(
         else:
             workspace = _kbw.resolve_workspace(claimed, board=board)
     except Exception as exc:
+        # Bucketed as a hold even when the breaker does not trip: a spawn that
+        # failed for a reason other than capacity means this tick was stuck.
+        result.spawn_failed.append(claimed.id)
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
@@ -2163,6 +2149,8 @@ def _dispatch_lane_task(
         infrastructure = isinstance(exc, RestartSafeScopeUnavailable)
         if infrastructure:
             _kb._log.warning("kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s", claimed.id, exc)
+        # Same as the workspace path: a failed spawn is a non-capacity hold.
+        result.spawn_failed.append(claimed.id)
         if _record_task_failure(
             conn, claimed.id, str(exc),
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
