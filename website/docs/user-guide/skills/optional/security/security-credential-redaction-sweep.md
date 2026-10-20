@@ -98,7 +98,8 @@ surface for a shape, and `patch` only for edits a redaction record does not need
    set plus unanchored variants of the prefix-anchored kinds, because a 20+ character run after those
    prefixes is never English. Assignment forms (`api_key = …`, `"refresh_token": "…"`) are the fuzzy
    layer: accept them only when the value is 16+ characters, has letters **and** digits, and is not a
-   dotted attribute or a snake_case identifier. *Done when* `scan` reports the planted fixture and not
+   dotted attribute or a snake_case identifier — a bare hex or base64 blob parses as an identifier too,
+   and is still a credential, so it is redacted. *Done when* `scan` reports the planted fixture and not
    the slug in the same file.
 4. **Sweep every form a copy can take.** The live tree; every tree that mirrors it (restored
    snapshots, another agent's workspace); logs and job output; archive members, which a tree sweep
