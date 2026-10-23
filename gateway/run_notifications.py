@@ -70,6 +70,26 @@ _COMPLETION_INJECTION_RETRY_MAX_DELAY = 60
 # Drain retries of a refused watch event follow the same bounded-backoff policy, keyed to the
 # 2 s drain cadence instead of the watcher's check interval (#140899).
 _WATCH_INJECTION_RETRY_BASE_DELAY = 4.0
+# A refusal that keeps repeating the SAME code is not a wait any state change inside the drain can
+# end (live: a lane whose route config postdates its durable origin produced admission_conflict
+# every 60 s for 18 h). ~45 min at the 60 s cap, then the event drops with one warning naming the
+# code; its output stays readable through process(action='log').
+_WATCH_REFUSAL_REPEAT_LIMIT = 45
+# Attributed refusal codes that are ROUTE/CONFIG-STATIC: nothing a retried delivery can observe
+# clears them, so a repeating one is bounded — and its durable row dropped — on BOTH refusal paths
+# (the drain's ``_requeue_refused_watch_event`` and the async-delegation completion retry).
+#   admission_conflict — the destination lane's route identity (chat/thread/user/profile stamp)
+#   does not match what its config admits; only a config or session rewrite changes that.
+# ``not_found``/``invalid_params`` are proven permanent earlier and keep the upstream cap instead.
+# Every OTHER attributed code clears on its own and is never dropped, however long it lasts:
+# runtime_draining (a restart's after-turn wait, a parked profile), queue_full (the FIFO frees),
+# storage_unavailable (writer patience returns), stale_generation/stale_epoch (a new generation is
+# adopted), session_busy (the owner's turn ends). An unattributed refusal also keeps retrying —
+# never give a result up on an unrecognised code.
+_BOUNDED_WAKE_REFUSALS = frozenset({"admission_conflict"})
+# Refusals that clear on their own: never dropped, however long they last (the named subset of the
+# unbounded codes above that the operator-facing drain tail keys off).
+_TRANSIENT_WAKE_REFUSALS = frozenset({"runtime_draining"})
 
 
 def _refusal_retry_at(step: int) -> float:
@@ -752,25 +772,35 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
     def _requeue_refused_watch_event(completion_queue, evt: dict) -> None:
         """Retry a refused watch event on a bounded backoff, never on every 2 s tick (#140899).
 
-        Only a refusal proven permanent (``WakeNotAccepted.permanent``: the route has no session,
-        or the payload is invalid) counts toward the cap that drops it. A transient one (a restart's
-        after-turn wait, a parked profile, a full owner FIFO) or one whose owner may still appear (an
-        unowned or foreign-pinned notice) waits it out however long it lasts.
+        A refusal proven permanent (``WakeNotAccepted.permanent``: the route has no session, or the
+        payload is invalid) drops at ``_MAX_COMPLETION_INJECTION_ATTEMPTS``. A refusal that repeats
+        a route/config-static code (``_BOUNDED_WAKE_REFUSALS``) is a defect rather than a wait —
+        nothing inside the drain can clear it — so it drops at ``_WATCH_REFUSAL_REPEAT_LIMIT`` with
+        one warning naming the code. A code that clears on its own (``runtime_draining``,
+        ``queue_full``, ``storage_unavailable``, ...) or an unattributed refusal (a notice whose
+        owner may still appear) stays queued however long it lasts.
         """
         step = int(evt.get("_watch_retry_step") or 0) + 1
         evt["_watch_retry_step"] = step
+        code = str(evt.get("_watch_refusal_code") or "")
+        refusals = int(evt.get("_watch_injection_attempts") or 0) + 1
+        evt["_watch_injection_attempts"] = refusals
         if evt.pop("_refusal_permanent", False):
-            refusals = int(evt.get("_watch_injection_attempts") or 0) + 1
-            evt["_watch_injection_attempts"] = refusals
-            if refusals >= _MAX_COMPLETION_INJECTION_ATTEMPTS:
-                logger.warning(
-                    "Watch notification for %s chat=%s (type=%s session_id=%s) was refused "
-                    "%d times; dropping the queued event (output remains available via "
-                    "process(action='log'))",
-                    evt.get("platform") or "?", evt.get("chat_id") or "?",
-                    evt.get("type") or "?", evt.get("session_id", "unknown"), refusals,
-                )
-                return
+            limit = _MAX_COMPLETION_INJECTION_ATTEMPTS
+        elif code in _BOUNDED_WAKE_REFUSALS:
+            limit = _WATCH_REFUSAL_REPEAT_LIMIT
+        else:
+            limit = 0
+        if limit and refusals >= limit:
+            logger.warning(
+                "Watch notification for %s chat=%s (type=%s session_id=%s) was refused "
+                "%d times (%s); dropping the queued event (output remains available via "
+                "process(action='log'))",
+                evt.get("platform") or "?", evt.get("chat_id") or "?",
+                evt.get("type") or "?", evt.get("session_id", "unknown"), refusals,
+                code or "permanent",
+            )
+            return
         evt["_watch_next_retry_at"] = _refusal_retry_at(step)
         completion_queue.put(evt)
 
@@ -959,6 +989,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 return None
             if not raise_not_accepted:
                 evt["_refusal_permanent"] = exc.permanent  # the drain counts only permanent refusals
+                evt["_watch_refusal_code"] = str(exc) or "not_accepted"
             logger.warning("Watch notification not admitted for %s chat=%s: %s",
                            platform_name, source.chat_id, exc)
             # Durable callers refund the claim; ordinary watch callers just requeue.
@@ -1076,6 +1107,51 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             getattr(_ad, fn_name)(delegation_id, claim_id)
         except Exception:
             logger.log(logging.WARNING if kind == "complete" else logging.DEBUG, fail_msg, exc_info=True)
+
+    def _note_bounded_completion_refusal(self, delegation_ids, code: str) -> set:
+        """Count one attributed refusal per durable row; return the rows that reached the budget.
+
+        The completion retry is the path a refusal can loop on forever: the refusal is refunded
+        (``defer``) so the row never spends its delivery attempts, and the watcher re-offers the
+        group at the 60 s cap — one WARNING per minute, one immortal ``pending`` row (live: thread
+        287584, ``deleg_34f266be``). A route/config-static code (``_BOUNDED_WAKE_REFUSALS``) is not
+        a wait, so it is bounded at ``_WATCH_REFUSAL_REPEAT_LIMIT`` exactly like the drain path:
+        this names the code ONCE, and the caller settles the row ``dropped`` instead of refunding
+        it, so nothing stays ``pending`` and the event is not re-offered. Every unbounded code
+        (``runtime_draining`` and the other self-clearing refusals) is left to retry.
+
+        The count is lifecycle-scoped, like the drain's per-event counter: a restart re-arms the
+        budget, and ``_MAX_COMPLETION_REPLAY_AGE_S`` bounds the replay at startup.
+        """
+        if code not in _BOUNDED_WAKE_REFUSALS:
+            return set()
+        exhausted = set()
+        with self._completion_delivery_lock:
+            for delegation_id in delegation_ids:
+                if not delegation_id:
+                    continue
+                count = self._completion_refusal_counts.get(delegation_id, 0) + 1
+                if count >= _WATCH_REFUSAL_REPEAT_LIMIT:
+                    # Cleared, so a failed ledger write re-arms the budget instead of leaving a
+                    # count that would drop the next attempt's result without retrying it.
+                    self._completion_refusal_counts.pop(delegation_id, None)
+                    exhausted.add(delegation_id)
+                    if count == _WATCH_REFUSAL_REPEAT_LIMIT:
+                        logger.warning(
+                            "Async delegation %s was refused admission %d times (%s); dropping the "
+                            "completion and its durable row — the refusal is route/config-static, "
+                            "not a wait (result remains queryable in the delegation records)",
+                            delegation_id, count, code,
+                        )
+                    continue
+                self._completion_refusal_counts[delegation_id] = count
+        return exhausted
+
+    def _clear_completion_refusals(self, delegation_ids) -> None:
+        """A settled row carries no retry history into its next (replayed) delivery."""
+        with self._completion_delivery_lock:
+            for delegation_id in delegation_ids:
+                self._completion_refusal_counts.pop(delegation_id, None)
 
     async def _completion_delivery_ready(self, evt: dict) -> bool:
         """Unavailable owners/transports must not spend a durable delivery attempt."""
@@ -1233,6 +1309,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         identity = self._completion_delivery_identity(evt)
         claim = self._CompletionClaim()
         accepted = identity_claimed = refused = False
+        exhausted: set = set()
         try:
             claim = await self._preflight_completion_delivery(evt)
             if not claim.proceed:
@@ -1265,19 +1342,29 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         except WakeNotAccepted as exc:
             # A proven-permanent refusal spends its durable attempt, so the row converges to
             # ``dropped`` across restarts too (#141153); any other (restart wait, full FIFO, an owner
-            # not yet proven) is refunded and never drops a completion the owner will take later.
+            # not yet proven) is refunded and never drops a completion the owner will take later —
+            # unless it repeats a route/config-static code past the repeat budget, which is a defect
+            # and not a wait: that settles the row ``dropped`` and stops re-offering the event.
             refused = not exc.permanent
-            return False
+            if refused:
+                rows = [claim.delegation_id] + [
+                    sibling["delegation_id"] for sibling, _claim_id in sibling_claims]
+                exhausted = self._note_bounded_completion_refusal(rows, str(exc.reason or exc))
+            return None if exhausted else False
         finally:
             if identity_claimed and not accepted:
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)
             operation = "complete" if accepted else "defer" if refused or claim.defer else "release"
-            if claim.claim_id:
-                self._settle_durable_claim(operation, claim.delegation_id, claim.claim_id)
-            for sibling, claim_id in sibling_claims:
-                if claim_id:
-                    self._settle_durable_claim(operation, sibling["delegation_id"], claim_id)
+            claim_ops = [(claim.delegation_id, claim.claim_id)]
+            claim_ops += [(sibling["delegation_id"], claim_id) for sibling, claim_id in sibling_claims]
+            for delegation_id, claim_id in claim_ops:
+                if not claim_id:
+                    continue
+                self._settle_durable_claim(
+                    "drop" if delegation_id in exhausted else operation, delegation_id, claim_id)
+            if accepted or exhausted:
+                self._clear_completion_refusals([delegation_id for delegation_id, _ in claim_ops])
             if accepted and sibling_claims:
                 self._record_coalesced_completion_siblings([event for event, _claim_id in sibling_claims])
 

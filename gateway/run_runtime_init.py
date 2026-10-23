@@ -123,6 +123,10 @@ class GatewayRuntimeInitMixin:
         self._completion_deliveries_inflight: set[tuple[str, str, object]] = set()
         self._completion_deliveries_delivered: OrderedDict[tuple[str, str, object], None] = OrderedDict()
         self._completion_delivery_retention = 2048
+        # Per-row count of route/config-static admission refusals (``_BOUNDED_WAKE_REFUSALS``):
+        # the completion retry refunds every unadmitted delivery, so without this its durable row
+        # never converges. Lifecycle-scoped like the drain path's per-event counter.
+        self._completion_refusal_counts: dict[str, int] = {}
         # Agent-triggered terminal completions from one conversation often land in the same scheduler
         # tick; hold them briefly so the agent gets one synthetic turn instead of one per process.
         # See #70300.
