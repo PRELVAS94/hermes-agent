@@ -330,6 +330,39 @@ def _route_identity(source):
     return {key: value for key, value in source.to_dict().items() if key != 'message_id'}
 
 
+def _routed_route_identity(runner, source, adapter_profile=None):
+    """``_route_identity`` with the profile the lane's route resolves to NOW when a side has none.
+
+    A routing entry's ``origin`` is written once (``_route_create``) and never refreshed, while the
+    committed envelope carries whatever profile INGRESS stamped when its human turn was admitted. A
+    lane whose ``gateway.profile_routes`` entry postdates its origin is therefore compared against
+    itself and always loses: the wake rebuilt from that origin has no ``profile`` while its own last
+    envelope has one, so every process/watch/completion notice on that lane is refused
+    ``admission_conflict`` (never delivered, requeued forever).
+
+    Fill only a MISSING side, on BOTH sides, by asking the resolver ingress asks
+    (``_profile_name_for_source``) with the receiving adapter's profile — the same argument
+    ``session_identity.resolve_identity`` passes — so a route scoped to one bot resolves here too.
+    A side that already carries a profile is never overridden: chat/thread/user/scope drift, and a
+    lane re-homed to a different profile, still fail.
+    """
+    identity = _route_identity(source)
+    if identity.get('profile'):
+        return identity
+    resolve = getattr(runner, '_profile_name_for_source', None)
+    if not callable(resolve):
+        return identity
+    from gateway.profile_routing import ProfileRouteRejected
+    try:
+        resolved = (resolve(source, adapter_profile=adapter_profile) if adapter_profile
+                    else resolve(source))
+    except ProfileRouteRejected:  # an unserved/rejected route never widens the comparison
+        return identity
+    if resolved:
+        identity['profile'] = resolved
+    return identity
+
+
 def committed_route_envelope(authority, entry):
     """The route's last committed native envelope with connector provenance (what a producer turn
     borrows), or ``None`` while no human message was admitted there."""
@@ -365,8 +398,12 @@ def snapshot_automation(authority, adapter, event, identity):
     restored = restore_native({'text': event.text, 'native_text_v1': {
         key: value for key, value in envelope.items() if key != 'media'}}, runner)
     # Synthetic wakes clear ``message_id`` (#52694, #123097) while the committed human source keeps
-    # it, so compare the routing/provenance identity, never the platform reply anchor.
-    if (_route_identity(restored.source) != _route_identity(event.source)
+    # it, so compare the routing/provenance identity, never the platform reply anchor. Both sides
+    # are one lane: resolve a profile neither side carries the way ingress did for its own stamp,
+    # with the receiving bot's profile (``None`` for the primary, exactly as ``resolve_identity``).
+    _registered, adapter_profile = runner._owning_profile(adapter, event.source.platform)
+    if (_routed_route_identity(runner, restored.source, adapter_profile)
+            != _routed_route_identity(runner, event.source, adapter_profile)
             or runner._adapter_for_source(restored.source) is not adapter):
         raise RuntimeStoreError('admission_conflict')
     provenance = deepcopy(envelope['provenance'])
